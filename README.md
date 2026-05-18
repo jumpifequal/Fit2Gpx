@@ -2,6 +2,11 @@
 
 Command-line converter from Garmin/FIT activity files to GPX.
 
+## Dependencies
+
+The Visual Studio project uses the bundled Garmin FIT SDK sources plus Windows
+WinHTTP from the Windows SDK for elevation API requests.
+
 ## Usage
 
 ```text

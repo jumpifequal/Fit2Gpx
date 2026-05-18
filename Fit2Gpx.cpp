@@ -1,22 +1,19 @@
-#ifndef NOMINMAX
+ï»¿#ifndef NOMINMAX
 #define NOMINMAX
 #endif
 
 #ifdef _MSC_VER
-// Required for static libcurl on Windows (schannel/sspi build)
-#pragma comment(lib, "Ws2_32.lib")
-#pragma comment(lib, "Crypt32.lib")
-#pragma comment(lib, "Normaliz.lib")
-#pragma comment(lib, "Wldap32.lib")
-#pragma comment(lib, "Secur32.lib")
-#pragma comment(lib, "Bcrypt.lib")
-#pragma comment(lib, "Iphlpapi.lib")
+#pragma comment(lib, "Winhttp.lib")
 #endif
+
+#include <windows.h>
+#include <winhttp.h>
 
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <string>
 #include <vector>
 #include <utility>
@@ -24,14 +21,11 @@
 #include <algorithm>
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include <chrono>
 #include <iomanip>
 #include <set>
 #include <map>
-
-#include <curl/curl.h>
-#include <nlohmann/json.hpp>
-#include <tinyxml2.h>
 
 // --- Garmin FIT SDK headers (in ./garmin_sdk) ---
 #include "garmin_sdk/fit_decode.hpp"
@@ -39,8 +33,6 @@
 #include "garmin_sdk/fit_record_mesg.hpp"
 #include "garmin_sdk/fit_mesg_listener.hpp"
 #include "garmin_sdk/fit_runtime_exception.hpp"
-
-using json = nlohmann::json;
 
 // ===================== Utilities =====================
 
@@ -96,45 +88,98 @@ static std::vector<std::string> Split(const std::string& s, char delim) {
     return out;
 }
 
-// ===================== HTTP via libcurl =====================
-
-static size_t CurlWriteToString(void* contents, size_t sz, size_t nmemb, void* userp) {
-    size_t total = sz * nmemb;
-    std::string* s = static_cast<std::string*>(userp);
-    s->append(static_cast<const char*>(contents), total);
-    return total;
+static std::wstring Utf8ToWide(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    if (len <= 0) return std::wstring();
+    std::wstring out((size_t)len, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &out[0], len);
+    return out;
 }
+
+// ===================== HTTP via WinHTTP =====================
 
 static bool HttpPostJson(const std::string& url,
     const std::string& json_body,
     std::string& out_response,
     long timeout_ms = 10000) {
-    CURL* curl = curl_easy_init();
-    if (!curl) return false;
+    std::wstring wideUrl = Utf8ToWide(url);
+    URL_COMPONENTS parts{};
+    parts.dwStructSize = sizeof(parts);
+    parts.dwSchemeLength = (DWORD)-1;
+    parts.dwHostNameLength = (DWORD)-1;
+    parts.dwUrlPathLength = (DWORD)-1;
+    parts.dwExtraInfoLength = (DWORD)-1;
 
-    struct curl_slist* headers = nullptr;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POST, 1L);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body.c_str());
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)json_body.size());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteToString);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out_response);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-
-    CURLcode res = curl_easy_perform(curl);
-    long http_code = 0;
-    if (res == CURLE_OK) {
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    if (!WinHttpCrackUrl(wideUrl.c_str(), (DWORD)wideUrl.size(), 0, &parts)) {
+        return false;
     }
 
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
+    std::wstring host(parts.lpszHostName, parts.dwHostNameLength);
+    std::wstring path(parts.lpszUrlPath, parts.dwUrlPathLength);
+    if (parts.dwExtraInfoLength > 0) {
+        path.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
+    }
+    bool secure = (parts.nScheme == INTERNET_SCHEME_HTTPS);
 
-    return (res == CURLE_OK) && (http_code >= 200 && http_code < 300);
+    HINTERNET session = WinHttpOpen(L"Fit2Gpx/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS,
+        0);
+    if (!session) return false;
+
+    WinHttpSetTimeouts(session, timeout_ms, timeout_ms, timeout_ms, timeout_ms);
+
+    HINTERNET connect = WinHttpConnect(session, host.c_str(), parts.nPort, 0);
+    if (!connect) {
+        WinHttpCloseHandle(session);
+        return false;
+    }
+
+    HINTERNET request = WinHttpOpenRequest(connect, L"POST", path.c_str(),
+        nullptr, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        secure ? WINHTTP_FLAG_SECURE : 0);
+    if (!request) {
+        WinHttpCloseHandle(connect);
+        WinHttpCloseHandle(session);
+        return false;
+    }
+
+    const wchar_t* headers = L"Content-Type: application/json\r\n";
+    BOOL ok = WinHttpSendRequest(request,
+        headers, (DWORD)-1L,
+        (LPVOID)json_body.data(), (DWORD)json_body.size(),
+        (DWORD)json_body.size(), 0);
+    if (ok) ok = WinHttpReceiveResponse(request, nullptr);
+
+    DWORD status = 0;
+    DWORD statusSize = sizeof(status);
+    if (ok) {
+        ok = WinHttpQueryHeaders(request,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX,
+            &status, &statusSize, WINHTTP_NO_HEADER_INDEX);
+    }
+
+    if (ok && status >= 200 && status < 300) {
+        for (;;) {
+            DWORD available = 0;
+            if (!WinHttpQueryDataAvailable(request, &available) || available == 0) break;
+            std::string chunk(available, '\0');
+            DWORD read = 0;
+            if (!WinHttpReadData(request, &chunk[0], available, &read)) break;
+            chunk.resize(read);
+            out_response += chunk;
+        }
+    }
+
+    WinHttpCloseHandle(request);
+    WinHttpCloseHandle(connect);
+    WinHttpCloseHandle(session);
+
+    return ok && status >= 200 && status < 300;
 }
 
 // ===================== Data structures =====================
@@ -155,7 +200,7 @@ struct TrackPoint {
 static const std::string OPENTOPODATA_BASE = "https://api.opentopodata.org/v1/";
 static const size_t API_BATCH_SIZE = 100;
 
-// Describe datasets: what they’re best for and where they cover (brief)
+// Describe datasets: what theyâ€™re best for and where they cover (brief)
 struct DatasetInfo {
     const char* id;
     const char* best_for;  // short description / strengths
@@ -164,14 +209,14 @@ struct DatasetInfo {
 
 static const DatasetInfo kDatasetInfos[] = {
     { "srtm90m",  "Global baseline ~90 m (3 arc-sec) SRTM; good default when detail not critical.",
-                   "Global land roughly between 60°N and 56°S" },
+                   "Global land roughly between 60Â°N and 56Â°S" },
     { "srtm30m",  "Higher-detail SRTM (~30 m, SRTMGL1 v3); fewer voids than older SRTM90.",
                    "Near-global land (same SRTM latitude limits)" },
     { "aster30m", "ASTER GDEM (~30 m); good detail in mountains but can have artifacts in forests/snow.",
                    "Global land" },
     { "eudem25m", "EU-DEM (~25 m); balanced & clean DEM for European Union.",
                    "Europe (EU/EEA)" },
-    { "ned10m",   "US NED/3DEP (~10 m); higher detail—great for U.S. hiking/biking.",
+    { "ned10m",   "US NED/3DEP (~10 m); higher detailâ€”great for U.S. hiking/biking.",
                    "United States (CONUS, AK/HI varies)" },
     { "nzdem8m",  "NZ 8 m DEM; very detailed for local routes.",
                    "New Zealand" },
@@ -219,6 +264,61 @@ static void PrintAllowedDatasetsDetailed() {
     std::cout << "You may specify multiple datasets separated by commas (e.g. srtm30m,eudem25m).\n";
 }
 
+static std::string BuildElevationRequestJson(
+    const std::vector<std::pair<size_t, std::pair<double, double>>>& batch)
+{
+    std::ostringstream out;
+    out << std::setprecision(10) << "{\"locations\":[";
+    for (size_t i = 0; i < batch.size(); ++i) {
+        if (i > 0) out << ",";
+        out << "{\"lat\":" << batch[i].second.first
+            << ",\"lng\":" << batch[i].second.second << "}";
+    }
+    out << "]}";
+    return out.str();
+}
+
+static void ParseElevationResponse(
+    const std::string& resp,
+    const std::vector<std::pair<size_t, std::pair<double, double>>>& batch,
+    std::vector<TrackPoint>& points)
+{
+    if (resp.find("\"status\"") != std::string::npos &&
+        resp.find("\"OK\"") == std::string::npos) {
+        std::cerr << "[elev] API did not return OK\n";
+        return;
+    }
+
+    size_t pos = 0;
+    size_t resultIndex = 0;
+    while (resultIndex < batch.size()) {
+        pos = resp.find("\"elevation\"", pos);
+        if (pos == std::string::npos) break;
+
+        pos = resp.find(':', pos);
+        if (pos == std::string::npos) break;
+        ++pos;
+
+        while (pos < resp.size() && std::isspace((unsigned char)resp[pos])) ++pos;
+        if (resp.compare(pos, 4, "null") == 0) {
+            ++resultIndex;
+            pos += 4;
+            continue;
+        }
+
+        char* end = nullptr;
+        double elevation = std::strtod(resp.c_str() + pos, &end);
+        if (end != resp.c_str() + pos) {
+            size_t idx = batch[resultIndex].first;
+            points[idx].ele = elevation;
+            points[idx].has_ele = true;
+            pos = (size_t)(end - resp.c_str());
+        }
+
+        ++resultIndex;
+    }
+}
+
 static void FetchElevationBatch(
     const std::vector<std::pair<size_t, std::pair<double, double>>>& batch,
     const std::string& dataset_csv,
@@ -226,103 +326,68 @@ static void FetchElevationBatch(
 {
     if (batch.empty()) return;
 
-    json payload;
-    payload["locations"] = json::array();
-    for (auto& it : batch) {
-        payload["locations"].push_back({ {"lat", it.second.first}, {"lng", it.second.second} });
-    }
-
     // OpenTopoData supports comma-separated datasets in the path: /v1/<d1,d2,...>
     std::string url = OPENTOPODATA_BASE + dataset_csv;
     std::string resp;
+    std::string payload = BuildElevationRequestJson(batch);
 
-    if (!HttpPostJson(url, payload.dump(), resp)) {
+    if (!HttpPostJson(url, payload, resp)) {
         std::cerr << "[elev] HTTP error contacting " << url << "\n";
         return;
     }
 
-    try {
-        auto j = json::parse(resp);
-        if (j.contains("status") && j["status"] == "OK" && j.contains("results")) {
-            const auto& results = j["results"];
-            for (size_t i = 0; i < results.size() && i < batch.size(); ++i) {
-                auto idx = batch[i].first;
-                if (results[i].contains("elevation") && !results[i]["elevation"].is_null()) {
-                    points[idx].ele = results[i]["elevation"].get<double>();
-                    points[idx].has_ele = true;
-                }
-            }
-        }
-        else {
-            std::string st = j.value("status", "UNKNOWN");
-            std::string em = j.value("error_message", "");
-            std::cerr << "[elev] API status=" << st << " error=" << em << "\n";
-        }
-    }
-    catch (const std::exception& e) {
-        std::cerr << "[elev] JSON parse error: " << e.what() << "\n";
-    }
+    ParseElevationResponse(resp, batch, points);
 }
 
-// ===================== GPX writer (TinyXML2 fully-qualified) =====================
+// ===================== GPX writer =====================
 
 static bool WriteGpx(const std::string& outPath, const std::vector<TrackPoint>& pts) {
-    tinyxml2::XMLDocument doc;
-    auto decl = doc.NewDeclaration(R"(xml version="1.0" encoding="UTF-8")");
-    doc.InsertFirstChild(decl);
+    std::ofstream out(outPath, std::ios::binary);
+    if (!out) {
+        std::cerr << "[gpx] Cannot create output file\n";
+        return false;
+    }
 
-    tinyxml2::XMLElement* gpx = doc.NewElement("gpx");
-    gpx->SetAttribute("version", "1.1");
-    gpx->SetAttribute("creator", "FIT to GPX Converter (C++/libcurl)");
-    gpx->SetAttribute("xmlns", "http://www.topografix.com/GPX/1/1");
-    gpx->SetAttribute("xmlns:gpxtpx", "http://www.garmin.com/xmlschemas/TrackPointExtension/v1");
-    doc.InsertEndChild(gpx);
-
-    tinyxml2::XMLElement* trk = doc.NewElement("trk");
-    gpx->InsertEndChild(trk);
-    tinyxml2::XMLElement* seg = doc.NewElement("trkseg");
-    trk->InsertEndChild(seg);
+    out << std::fixed << std::setprecision(8);
+    out << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+    out << "<gpx version=\"1.1\" creator=\"FIT to GPX Converter (C++/WinHTTP)\" "
+        << "xmlns=\"http://www.topografix.com/GPX/1/1\" "
+        << "xmlns:gpxtpx=\"http://www.garmin.com/xmlschemas/TrackPointExtension/v1\">\n";
+    out << "  <trk>\n";
+    out << "    <trkseg>\n";
 
     for (const auto& p : pts) {
-        tinyxml2::XMLElement* trkpt = doc.NewElement("trkpt");
-        trkpt->SetAttribute("lat", p.latDeg);
-        trkpt->SetAttribute("lon", p.lonDeg);
+        out << "      <trkpt lat=\"" << p.latDeg << "\" lon=\"" << p.lonDeg << "\">\n";
 
         if (p.has_ele) {
-            tinyxml2::XMLElement* ele = doc.NewElement("ele");
-            ele->SetText(p.ele);
-            trkpt->InsertEndChild(ele);
+            out << "        <ele>" << p.ele << "</ele>\n";
         }
         if (p.has_time) {
-            tinyxml2::XMLElement* time = doc.NewElement("time");
-            std::string s = ToIso8601Utc(p.t);
-            time->SetText(s.c_str());
-            trkpt->InsertEndChild(time);
+            out << "        <time>" << ToIso8601Utc(p.t) << "</time>\n";
         }
 
         if (p.has_hr || p.has_cad) {
-            tinyxml2::XMLElement* ext = doc.NewElement("extensions");
-            tinyxml2::XMLElement* tpx = doc.NewElement("gpxtpx:TrackPointExtension");
+            out << "        <extensions>\n";
+            out << "          <gpxtpx:TrackPointExtension>\n";
             if (p.has_hr) {
-                tinyxml2::XMLElement* hr = doc.NewElement("gpxtpx:hr");
-                hr->SetText((unsigned)p.hr);
-                tpx->InsertEndChild(hr);
+                out << "            <gpxtpx:hr>" << (unsigned)p.hr << "</gpxtpx:hr>\n";
             }
             if (p.has_cad) {
-                tinyxml2::XMLElement* cad = doc.NewElement("gpxtpx:cad");
-                cad->SetText((unsigned)p.cad);
-                tpx->InsertEndChild(cad);
+                out << "            <gpxtpx:cad>" << (unsigned)p.cad << "</gpxtpx:cad>\n";
             }
-            ext->InsertEndChild(tpx);
-            trkpt->InsertEndChild(ext);
+            out << "          </gpxtpx:TrackPointExtension>\n";
+            out << "        </extensions>\n";
         }
 
-        seg->InsertEndChild(trkpt);
+        out << "      </trkpt>\n";
     }
 
-    tinyxml2::XMLError rc = doc.SaveFile(outPath.c_str());
-    if (rc != tinyxml2::XML_SUCCESS) {
-        std::cerr << "[gpx] SaveFile error code=" << rc << "\n";
+    out << "    </trkseg>\n";
+    out << "  </trk>\n";
+    out << "</gpx>\n";
+
+    if (!out) {
+        std::cerr << "[gpx] Write error\n";
         return false;
     }
     return true;
@@ -499,12 +564,10 @@ static bool ParseArgs(int argc, char** argv, Args& a) {
 
 int main(int argc, char** argv) {
     const auto t0 = std::chrono::steady_clock::now();
-    curl_global_init(CURL_GLOBAL_DEFAULT);
 
     Args args;
     if (!ParseArgs(argc, argv, args)) {
         ShowHelp(argv[0]);
-        curl_global_cleanup();
         return (args.showHelp ? 0 : 1);
     }
 
@@ -516,7 +579,7 @@ int main(int argc, char** argv) {
     }
 
     std::ifstream fitStream(args.fitFile, std::ios::binary);
-    if (!fitStream) { std::cerr << "[fit] Cannot open file\n"; curl_global_cleanup(); return 1; }
+    if (!fitStream) { std::cerr << "[fit] Cannot open file\n"; return 1; }
 
     RecordCollector collector;
 
@@ -546,19 +609,17 @@ int main(int argc, char** argv) {
     }
     catch (const std::exception& e) {
         std::cerr << "[fit] Exception: " << e.what() << "\n";
-        curl_global_cleanup();
         return 1;
     }
 
     if (collector.points.empty()) {
         std::cerr << "[fit] No track points found; writing empty GPX\n";
-        if (!WriteGpx(args.gpxFile, collector.points)) { curl_global_cleanup(); return 1; }
+        if (!WriteGpx(args.gpxFile, collector.points)) { return 1; }
         const auto t1 = std::chrono::steady_clock::now();
         double secs = std::chrono::duration<double>(t1 - t0).count();
         std::cout << "[gpx] Saved: " << args.gpxFile << "\n";
         std::cout << std::fixed << std::setprecision(3)
             << "[time] Conversion took " << secs << " s\n";
-        curl_global_cleanup();
         return 0;
     }
 
@@ -591,7 +652,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (!WriteGpx(args.gpxFile, collector.points)) { curl_global_cleanup(); return 1; }
+    if (!WriteGpx(args.gpxFile, collector.points)) { return 1; }
 
     const auto t1 = std::chrono::steady_clock::now();
     double secs = std::chrono::duration<double>(t1 - t0).count();
@@ -599,6 +660,5 @@ int main(int argc, char** argv) {
     std::cout << std::fixed << std::setprecision(3)
         << "[time] Conversion took " << secs << " s\n";
 
-    curl_global_cleanup();
     return 0;
 }
